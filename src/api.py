@@ -42,6 +42,8 @@ from typing import AsyncGenerator
 
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from torch_geometric.loader import DataLoader
 
@@ -140,6 +142,29 @@ app = FastAPI(
     ),
     version="1.2.0",
     lifespan=lifespan,
+)
+
+# Enable CORS for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify the actual frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve generated images as static files
+# generated_molecules/ -> /generated_molecules/
+# generated_explanations/ -> /generated_explanations/
+app.mount(
+    "/generated_molecules", 
+    StaticFiles(directory=str(PROJECT_ROOT / "generated_molecules")), 
+    name="molecules"
+)
+app.mount(
+    "/generated_explanations", 
+    StaticFiles(directory=str(PROJECT_ROOT / "generated_explanations")), 
+    name="explanations"
 )
 
 
