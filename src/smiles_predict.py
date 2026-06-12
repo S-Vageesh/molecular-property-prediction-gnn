@@ -5,6 +5,12 @@ adapters, and future explainability tools. It performs inference only:
 - no optimizer is created,
 - no backward pass is run,
 - no model weights are updated.
+
+New in this version
+-------------------
+The interactive entry point (``main``) now also generates a 2D molecule image
+via ``molecule_visualizer.visualize_molecule`` and prints the saved path,
+giving users both a numeric prediction and a visual reference in one step.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from predict import load_model  # noqa: E402
+from molecule_visualizer import visualize_molecule  # noqa: E402
 
 
 # MoleculeNet ESOL uses the PyTorch Geometric SMILES featurizer, which produces
@@ -121,20 +128,55 @@ def predict_smiles(smiles: str) -> float:
 
 
 def main() -> None:
-    """Interactive command-line entry point."""
+    """Interactive command-line entry point.
+
+    Workflow
+    --------
+    1. Prompt the user for a SMILES string.
+    2. Validate the SMILES and raise a clear error if it is invalid.
+    3. Generate and save a 2D molecule image via molecule_visualizer.
+    4. Run GCN solubility prediction via predict_smiles.
+    5. Print the predicted solubility and the path to the saved image.
+    """
 
     print("Enter SMILES:")
     smiles = input().strip()
 
+    # --- Step 1: Generate molecule image --------------------------------------
+
+    # visualize_molecule validates the SMILES with RDKit, renders the 2D
+    # structure, saves it as a PNG inside generated_molecules/, and returns the
+    # absolute path. Any invalid SMILES raises ValueError here before the
+    # heavier GCN inference is attempted.
+    try:
+        image_path = visualize_molecule(smiles)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1)
+
+    # --- Step 2: GCN solubility prediction ------------------------------------
+
+    # predict_smiles loads the trained model from models/gcn_esol.pth,
+    # featurizes the molecule into a PyG graph, and returns one float value
+    # representing the predicted log solubility (log mol/L).
     try:
         prediction = predict_smiles(smiles)
     except ValueError as exc:
         print(f"Error: {exc}")
-        raise
+        raise SystemExit(1)
+
+    # --- Step 3: Print results ------------------------------------------------
+
+    # Show the predicted solubility value rounded to two decimal places, then
+    # the relative path to the image so users can find it easily.
+    relative_image_path = image_path.relative_to(PROJECT_ROOT)
 
     print()
     print("Predicted Solubility:")
-    print(f"{prediction:.4f}")
+    print(f"{prediction:.2f}")
+    print()
+    print("Molecule Image Saved:")
+    print(str(relative_image_path))
 
 
 if __name__ == "__main__":
