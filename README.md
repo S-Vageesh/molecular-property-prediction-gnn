@@ -388,13 +388,13 @@ This project demonstrates:
 
 ## Author
 
-S. Vageesh
+S Vageesh
 
-Mechanical Engineering Student
+Mathematics and Computing Student
 
 Interested in:
 
+* Cryptography
 * Machine Learning
 * Graph Neural Networks
-* Cryptography
 * AI Research
