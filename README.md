@@ -87,6 +87,10 @@ Features:
 - View model benchmark results
 - Interactive user interface built with React and Vite
 
+### Live Demo
+
+![Demo](c:\Projects\GNN.gif)
+
 #### Prediction Example
 
 ![Testosterone](c:\Users\svage\OneDrive\Pictures\Screenshots\Screenshot 2026-06-13 020122.png)
