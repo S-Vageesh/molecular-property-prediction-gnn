@@ -73,6 +73,24 @@ Interactive API documentation available through FastAPI.
 
 ---
 
+## Demo
+
+### React Frontend Dashboard
+
+The project includes a React frontend integrated with the FastAPI backend.
+
+Features:
+
+- Predict molecular solubility from SMILES strings
+- Visualize molecular structures
+- Explain predictions using GNNExplainer
+- View model benchmark results
+- Interactive user interface built with React and Vite
+
+#### Prediction Example
+
+![Testosterone](C_C_12CC_C_H_3_C_H_CCC4_CC_O_CC_C_43C_C_H_1CC_C_H_2O.png)
+
 ## Project Architecture
 
 Input SMILES
