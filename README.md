@@ -89,11 +89,11 @@ Features:
 
 ### Live Demo
 
-![Demo](c:\Projects\GNN.gif)
+![Demo](docs/GNN.gif)
 
 #### Prediction Example
 
-![Testosterone](c:\Users\svage\OneDrive\Pictures\Screenshots\Screenshot 2026-06-13 020122.png)
+![Testosterone](docs/images/MPP_Dashboard.png)
 
 ## Project Architecture
 
