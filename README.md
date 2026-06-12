@@ -1,71 +1,378 @@
 # Molecular Property Prediction using Graph Neural Networks
 
-Predict molecular properties from chemical graph structures using Graph Neural Networks (GNNs). This project explores how graph-based deep learning can capture structural information in molecules to support property prediction tasks.
+An end-to-end machine learning platform for molecular property prediction using Graph Neural Networks (GNNs), featuring model benchmarking, explainable AI, molecule visualization, and REST API deployment.
 
-## Tech Stack
+---
 
-- **PyTorch** — deep learning framework
-- **PyTorch Geometric** — graph neural network library
-- **RDKit** — cheminformatics and molecular graph construction
-- **pandas** — data manipulation and analysis
-- **NumPy** — numerical computing
-- **scikit-learn** — machine learning utilities and evaluation
-- **matplotlib** — visualization
-- **NetworkX** — graph analysis and utilities
+## Overview
+
+Traditional machine learning models often struggle to capture the relational structure of molecules.
+
+This project represents molecules as graphs:
+
+* Atoms → Nodes
+* Bonds → Edges
+
+and applies Graph Neural Networks to predict molecular properties directly from molecular structure.
+
+The project uses the ESOL dataset and compares multiple GNN architectures to determine the most effective approach for molecular solubility prediction.
+
+---
+
+## Features
+
+### Molecular Property Prediction
+
+Predict aqueous solubility directly from SMILES strings using trained Graph Neural Networks.
+
+### Multiple GNN Architectures
+
+Implemented and benchmarked:
+
+* Graph Convolutional Network (GCN)
+* GraphSAGE
+* Graph Isomorphism Network (GIN)
+
+### Model Benchmarking
+
+All architectures are trained and evaluated using:
+
+* Identical dataset
+* Identical train/validation/test splits
+* Fixed random seed
+* Consistent evaluation pipeline
+
+allowing fair comparison of model performance.
+
+### Explainable AI
+
+Uses GNNExplainer to identify:
+
+* Important atoms
+* Important bonds
+* Influential molecular substructures
+
+for each prediction.
+
+### Molecule Visualization
+
+Generate 2D molecular structures directly from SMILES strings using RDKit.
+
+### REST API
+
+FastAPI backend supporting:
+
+* Prediction
+* Molecule visualization
+* Model explanation
+* Health monitoring
+
+### Swagger Documentation
+
+Interactive API documentation available through FastAPI.
+
+---
+
+## Project Architecture
+
+Input SMILES
+
+↓
+
+RDKit Molecule Parser
+
+↓
+
+Graph Construction
+
+↓
+
+Graph Neural Network
+
+(GCN / GraphSAGE / GIN)
+
+↓
+
+Property Prediction
+
+↓
+
+GNNExplainer
+
+↓
+
+Atom-Level Explanation
+
+---
+
+## Dataset
+
+Dataset:
+
+ESOL (Delaney Solubility Dataset)
+
+Properties:
+
+* 1,128 molecules
+* Experimental aqueous solubility values
+* Widely used molecular machine learning benchmark
+
+Split Strategy:
+
+* Train: 80%
+* Validation: 10%
+* Test: 10%
+
+Random seed fixed for reproducibility.
+
+---
+
+## Model Results
+
+| Model     | MAE    | RMSE   |
+| --------- | ------ | ------ |
+| GCN       | 1.4526 | 1.8407 |
+| GraphSAGE | 1.4160 | 1.7666 |
+| GIN       | 0.6876 | 0.8566 |
+
+### Best Performing Model
+
+GIN (Graph Isomorphism Network)
+
+The GIN architecture achieved the lowest error and was selected as the primary production model.
+
+---
+
+## Explainability
+
+The project includes explainability using GNNExplainer.
+
+Given a molecule, the system can:
+
+* Generate a prediction
+* Identify influential atoms
+* Visualize atom importance scores
+* Highlight molecular regions responsible for the prediction
+
+This allows users to understand not only what the model predicts but also why it predicts it.
+
+---
+
+## API Endpoints
+
+### Health Check
+
+GET /health
+
+Returns service status and model availability.
+
+---
+
+### Predict Solubility
+
+POST /predict
+
+Input:
+
+{
+"smiles": "CCO"
+}
+
+Output:
+
+{
+"predicted_solubility": -0.37
+}
+
+---
+
+### Visualize Molecule
+
+POST /visualize
+
+Input:
+
+{
+"smiles": "CCO"
+}
+
+Output:
+
+{
+"image_path": "generated_molecules/CCO.png"
+}
+
+---
+
+### Analyze Molecule
+
+POST /analyze
+
+Combined endpoint returning:
+
+* Prediction
+* Visualization
+* Metadata
+
+---
+
+### Explain Prediction
+
+POST /explain
+
+Input:
+
+{
+"smiles": "CCO"
+}
+
+Output:
+
+{
+"prediction": -0.37,
+"explanation_image": "generated_explanations/CCO_explanation.png"
+}
+
+---
 
 ## Project Structure
 
-```
 molecular-property-prediction-gnn/
-├── data/           # Raw and processed datasets
-├── notebooks/      # Exploratory analysis and experiments
-├── src/            # Source code (data loading, training, utilities)
-├── models/         # Saved model checkpoints and artifacts
-├── tests/          # Unit and integration tests
+
+├── data/
+
+├── generated_explanations/
+
+├── generated_molecules/
+
+├── models/
+
+│ ├── gcn_esol.pth
+
+│ ├── graphsage_esol.pth
+
+│ └── gin_esol.pth
+
+├── src/
+
+│ ├── train.py
+
+│ ├── train_graphsage.py
+
+│ ├── train_gin.py
+
+│ ├── evaluate.py
+
+│ ├── evaluate_graphsage.py
+
+│ ├── evaluate_gin.py
+
+│ ├── compare_models.py
+
+│ ├── molecule_visualizer.py
+
+│ ├── explain_gin.py
+
+│ ├── explanation_visualizer.py
+
+│ └── api.py
+
+├── tests/
+
 ├── requirements.txt
+
 └── README.md
-```
 
-## Status
+---
 
-Project setup in progress.
+## Installation
 
-## Model Explainability
+Clone the repository:
 
-The project includes an explainability pipeline for the **GIN (Graph Isomorphism Network)** model using **PyTorch Geometric GNNExplainer**.
+git clone https://github.com/S-Vageesh/molecular-property-prediction-gnn.git
 
-This allows users to identify which atoms in a molecule most strongly influenced the model's solubility prediction.
+cd molecular-property-prediction-gnn
 
-### Features
-- **GNNExplainer Integration**: Identifies influential nodes (atoms) and edges (bonds) via subgraph optimization.
-- **Heatmap Visualization**: Highlights important atoms in red on a 2D molecular diagram.
-- **API Support**: A dedicated `/explain` endpoint for real-time explanations.
+Install dependencies:
 
-### Usage
+pip install -r requirements.txt
 
-**Python API:**
-```python
-from src.explain_gin import explain_prediction
-from src.explanation_visualizer import visualize_explanation
+---
 
-prediction, explanation = explain_prediction("c1ccccc1")
-node_importance = explanation.node_mask.sum(dim=1)
-image_path = visualize_explanation("c1ccccc1", node_importance)
-print(f"Explanation saved to: {image_path}")
-```
+## Training
 
-**REST API:**
-```bash
-curl -X POST "http://localhost:5000/explain" \
-     -H "Content-Type: application/json" \
-     -d '{"smiles": "c1ccccc1"}'
-```
+Train GCN:
 
-The response includes the prediction and a path to the generated PNG:
-```json
-{
-  "smiles": "c1ccccc1",
-  "prediction": -2.84,
-  "explanation_image": "generated_explanations/c1ccccc1_explanation.png"
-}
-```
+python src/train.py
+
+Train GraphSAGE:
+
+python src/train_graphsage.py
+
+Train GIN:
+
+python src/train_gin.py
+
+---
+
+## Evaluation
+
+python src/evaluate.py
+
+python src/evaluate_graphsage.py
+
+python src/evaluate_gin.py
+
+---
+
+## Run API
+
+uvicorn src.api:app --reload
+
+Open:
+
+http://localhost:8000/docs
+
+for interactive Swagger documentation.
+
+---
+
+## Future Work
+
+* React frontend dashboard
+* Real-time molecule drawing interface
+* Additional molecular datasets
+* Hyperparameter optimization
+* Docker deployment
+* Cloud deployment (AWS)
+* Model monitoring and analytics
+
+---
+
+## Key Learning Outcomes
+
+This project demonstrates:
+
+* Graph Neural Networks
+* Molecular Machine Learning
+* PyTorch Geometric
+* Explainable AI
+* FastAPI Development
+* Model Benchmarking
+* Machine Learning Engineering
+* End-to-End ML System Design
+
+---
+
+## Author
+
+S. Vageesh
+
+Mechanical Engineering Student
+
+Interested in:
+
+* Machine Learning
+* Graph Neural Networks
+* Cryptography
+* AI Research
