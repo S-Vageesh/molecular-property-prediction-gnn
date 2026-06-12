@@ -89,7 +89,7 @@ Features:
 
 #### Prediction Example
 
-![Testosterone](C_C_12CC_C_H_3_C_H_CCC4_CC_O_CC_C_43C_C_H_1CC_C_H_2O.png)
+![Testosterone](c:\Users\svage\OneDrive\Pictures\Screenshots\Screenshot 2026-06-13 020122.png)
 
 ## Project Architecture
 
