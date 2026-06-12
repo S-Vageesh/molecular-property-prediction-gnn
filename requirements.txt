@@ -8,3 +8,5 @@ matplotlib
 networkx
 fastapi
 uvicorn
+httpx
+pytest

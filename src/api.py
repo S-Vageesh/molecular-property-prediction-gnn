@@ -6,6 +6,7 @@ GET  /           — service banner
 GET  /health      — liveness check
 POST /predict     — GCN solubility prediction from a SMILES string
 POST /visualize   — 2D molecule image generation from a SMILES string
+POST /analyze     — combined prediction + visualization in one call
 
 Design notes
 ------------
@@ -17,16 +18,15 @@ Design notes
 - Invalid SMILES always produce HTTP 400 with a descriptive detail message.
 - The architecture (GCNModel) is never modified here. Inference is read-only:
   torch.no_grad() is used throughout and model.eval() is set at load time.
+- All shared logic lives in two private helpers (_infer_solubility and
+  _generate_image_path) so /predict, /visualize, and /analyze never
+  duplicate code.
 
 Running
 -------
 From the project root:
 
     uvicorn src.api:app --reload --host 0.0.0.0 --port 5000
-
-Or with explicit host/port for production:
-
-    uvicorn src.api:app --host 0.0.0.0 --port 5000
 
 Interactive API docs are available at:
     http://localhost:5000/docs   (Swagger UI)
@@ -70,12 +70,12 @@ from molecule_visualizer import visualize_molecule  # noqa: E402
 # ---------------------------------------------------------------------------
 # Module-level model cache
 # ---------------------------------------------------------------------------
-# These are populated during the lifespan startup event and referenced by the
-# /predict endpoint. Using a plain dict avoids global-statement linting noise.
+# Populated during lifespan startup; referenced by every inference endpoint.
+# Using a plain dict avoids global-statement linting noise.
 
 _cache: dict = {
-    "device": None,   # torch.device — cpu or cuda
-    "model": None,    # torch.nn.Module — the loaded GCN
+    "device": None,  # torch.device — cpu or cuda
+    "model": None,   # torch.nn.Module — the loaded GCN
 }
 
 
@@ -89,10 +89,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     Using the lifespan pattern (rather than @app.on_event) is the recommended
     approach in FastAPI ≥ 0.93. The model is loaded before the server begins
-    serving requests so the first /predict call has no extra latency.
+    serving requests so the first inference call has no extra latency.
     """
-
-    # Choose GPU if one is available; otherwise fall back to CPU transparently.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # load_model reads models/gcn_esol.pth, infers the checkpoint format,
@@ -106,12 +104,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     print(f"[startup] GCN model loaded on {device}")
     print(f"[startup] Model path: {PROJECT_ROOT / 'models' / 'gcn_esol.pth'}")
 
-    # Yield control to FastAPI — the server serves requests between here and
-    # the code after yield (which runs on shutdown).
-    yield
+    yield  # Server handles requests between here and the code below.
 
-    # Shutdown: nothing explicit to release for a CPU/GPU PyTorch model, but
-    # clearing the cache is good practice for test isolation.
+    # Shutdown: clear cache for clean test isolation and process shutdown.
     _cache["device"] = None
     _cache["model"] = None
     print("[shutdown] Model cache cleared.")
@@ -126,9 +121,11 @@ app = FastAPI(
     description=(
         "A REST API that exposes a Graph Convolutional Network (GCN) trained "
         "on the ESOL dataset to predict aqueous solubility (log mol/L) from "
-        "SMILES molecular representations. Also generates 2D structure images."
+        "SMILES molecular representations. Also generates 2D structure images.\n\n"
+        "**Quickstart:** Use `POST /analyze` to get both prediction and image in "
+        "one request — ideal for frontend consumption."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -138,7 +135,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 
 class SMILESRequest(BaseModel):
-    """Shared request body for endpoints that accept a SMILES string."""
+    """Shared request body for all endpoints that accept a SMILES string."""
 
     smiles: str = Field(
         ...,
@@ -173,6 +170,31 @@ class VisualizeResponse(BaseModel):
     )
 
 
+class AnalyzeResponse(BaseModel):
+    """Response body returned by POST /analyze.
+
+    Combines the outputs of /predict and /visualize so a frontend can
+    retrieve everything it needs — solubility value and molecule image path
+    — with a single HTTP request instead of two sequential calls.
+    """
+
+    smiles: str = Field(
+        description="The original SMILES string supplied by the caller."
+    )
+    predicted_solubility: float = Field(
+        description=(
+            "GCN-predicted aqueous solubility in log(mol/L). "
+            "More negative values mean lower solubility."
+        )
+    )
+    image_path: str = Field(
+        description=(
+            "Relative path (from the project root) to the saved PNG file, "
+            "e.g. 'generated_molecules/CCO.png'."
+        )
+    )
+
+
 class HealthResponse(BaseModel):
     """Response body returned by GET /health."""
 
@@ -183,6 +205,105 @@ class RootResponse(BaseModel):
     """Response body returned by GET /."""
 
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Private helpers — shared inference and visualization logic
+# ---------------------------------------------------------------------------
+
+def _require_model() -> None:
+    """Raise HTTP 503 if the model cache was not populated at startup."""
+    if _cache["model"] is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model is not available. The server may still be starting up.",
+        )
+
+
+def _infer_solubility(smiles: str) -> float:
+    """Validate a SMILES string and run GCN inference; return log solubility.
+
+    This is the single source of truth for inference logic. Both /predict and
+    /analyze call this function so the forward-pass code is never duplicated.
+
+    Parameters
+    ----------
+    smiles:
+        Raw SMILES string from the request body.
+
+    Returns
+    -------
+    float
+        Predicted aqueous solubility in log(mol/L), rounded to 4 decimal
+        places.
+
+    Raises
+    ------
+    HTTPException (400)
+        If ``smiles`` is empty or cannot be parsed as a valid molecule.
+    """
+
+    # smiles_to_graph() validates with RDKit, canonicalizes, and builds a PyG
+    # Data object. It raises ValueError for any invalid molecule string.
+    try:
+        graph = smiles_to_graph(smiles)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    device: torch.device = _cache["device"]
+    model: torch.nn.Module = _cache["model"]
+
+    # DataLoader wraps the single graph in a mini-batch and adds the batch
+    # assignment vector that global_mean_pool expects.
+    loader = DataLoader([graph], batch_size=1, shuffle=False)
+    batch = next(iter(loader)).to(device)
+
+    # no_grad() ensures inference never updates model weights or stores
+    # gradient state. model.eval() was already called by load_model().
+    with torch.no_grad():
+        raw = model(
+            batch.x.float(),
+            batch.edge_index,
+            batch.batch,
+        ).view(-1)[0].item()
+
+    return round(raw, 4)
+
+
+def _generate_image_path(smiles: str) -> str:
+    """Validate a SMILES string, render a 2D image, and return its relative path.
+
+    This is the single source of truth for visualization logic. Both
+    /visualize and /analyze call this function so the image-generation code
+    is never duplicated.
+
+    Parameters
+    ----------
+    smiles:
+        Raw SMILES string from the request body.
+
+    Returns
+    -------
+    str
+        Relative path from the project root to the saved PNG, e.g.
+        ``'generated_molecules/CCO.png'``.
+
+    Raises
+    ------
+    HTTPException (400)
+        If ``smiles`` is empty or cannot be parsed as a valid molecule.
+    """
+
+    # visualize_molecule validates with RDKit, computes 2D coords, renders the
+    # structure, saves the PNG, and returns the absolute Path.
+    try:
+        absolute_path = visualize_molecule(smiles)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Return a project-root-relative string so callers are not tied to the
+    # server's absolute filesystem layout.
+    return str(absolute_path.relative_to(PROJECT_ROOT))
 
 
 # ---------------------------------------------------------------------------
@@ -211,19 +332,13 @@ async def root() -> RootResponse:
     tags=["meta"],
 )
 async def health() -> HealthResponse:
-    """Confirm that the server process is alive and the model is loaded.
+    """Confirm that the server process is alive and the GCN model is loaded.
 
-    Returns HTTP 200 with ``{"status": "healthy"}`` when the GCN model has
-    been loaded successfully. This endpoint is suitable for use as a
-    Kubernetes/Docker liveness or readiness probe.
+    Returns HTTP 200 with ``{"status": "healthy"}`` when the model is ready.
+    Returns HTTP 503 if startup failed or the model has not loaded yet.
+    Suitable for use as a Kubernetes/Docker liveness or readiness probe.
     """
-    # If lifespan startup failed, _cache["model"] would be None. We surface
-    # that as a 503 rather than silently returning a misleading "healthy".
-    if _cache["model"] is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model is not loaded. The server may still be starting up.",
-        )
+    _require_model()
     return HealthResponse(status="healthy")
 
 
@@ -236,66 +351,19 @@ async def health() -> HealthResponse:
 async def predict(request: SMILESRequest) -> PredictResponse:
     """Run GCN inference and return the predicted log solubility.
 
-    The SMILES string is first validated with RDKit; any syntactically or
-    chemically invalid input returns HTTP 400 before the model is touched.
+    The SMILES string is validated with RDKit before the model is touched.
     The cached GCN model is used — no checkpoint file is read per request.
 
-    Parameters
-    ----------
-    request:
-        JSON body containing a ``smiles`` field.
+    - **Valid input** → HTTP 200 with predicted solubility
+    - **Invalid SMILES** → HTTP 400 with a descriptive error message
+    - **Empty string** → HTTP 422 (caught by Pydantic `min_length=1`)
 
-    Returns
-    -------
-    PredictResponse
-        The original SMILES and the predicted solubility as a float.
-
-    Raises
-    ------
-    HTTPException (400)
-        If the SMILES string is empty or cannot be parsed by RDKit.
-    HTTPException (503)
-        If the model was not loaded at startup (should not happen in normal
-        operation).
+    > Tip: Use `POST /analyze` to get both the solubility and molecule image
+    > in a single request.
     """
-
-    # Guard: model must be available (populated by lifespan startup).
-    if _cache["model"] is None:
-        raise HTTPException(status_code=503, detail="Model is not available.")
-
-    # --- SMILES validation and graph construction ----------------------------
-    # smiles_to_graph() runs RDKit's Chem.MolFromSmiles, canonicalizes the
-    # SMILES, and builds a PyTorch Geometric Data object. It raises ValueError
-    # for any input that is not a valid molecule.
-    try:
-        graph = smiles_to_graph(request.smiles)
-    except ValueError as exc:
-        # Translate the domain-level ValueError into an HTTP 400 response so
-        # clients receive a standard error format with a descriptive message.
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    device: torch.device = _cache["device"]
-    model: torch.nn.Module = _cache["model"]
-
-    # --- Batching and inference ----------------------------------------------
-    # DataLoader wraps the single-molecule graph in a mini-batch and adds the
-    # batch assignment vector required by global_mean_pool in the GCN.
-    loader = DataLoader([graph], batch_size=1, shuffle=False)
-    batch = next(iter(loader)).to(device)
-
-    # no_grad() guarantees no gradients are computed or stored — inference
-    # only. The model is already in eval() mode from startup.
-    with torch.no_grad():
-        raw_prediction = model(
-            batch.x.float(),
-            batch.edge_index,
-            batch.batch,
-        ).view(-1)[0].item()
-
-    return PredictResponse(
-        smiles=request.smiles,
-        predicted_solubility=round(raw_prediction, 4),
-    )
+    _require_model()
+    solubility = _infer_solubility(request.smiles)
+    return PredictResponse(smiles=request.smiles, predicted_solubility=solubility)
 
 
 @app.post(
@@ -307,37 +375,69 @@ async def predict(request: SMILESRequest) -> PredictResponse:
 async def visualize(request: SMILESRequest) -> VisualizeResponse:
     """Render a 2D molecular structure image and save it as a PNG.
 
-    Delegates to ``molecule_visualizer.visualize_molecule`` which handles
+    Delegates to `molecule_visualizer.visualize_molecule` which handles
     RDKit parsing, 2D coordinate generation, and PNG export. The image is
-    saved under ``generated_molecules/`` in the project root and the
-    relative path is returned to the caller.
+    saved under `generated_molecules/` in the project root.
 
-    Parameters
-    ----------
-    request:
-        JSON body containing a ``smiles`` field.
+    - **Valid input** → HTTP 200 with relative image path
+    - **Invalid SMILES** → HTTP 400 with a descriptive error message
+    - **Empty string** → HTTP 422 (caught by Pydantic `min_length=1`)
 
-    Returns
-    -------
-    VisualizeResponse
-        Relative path to the saved PNG file.
-
-    Raises
-    ------
-    HTTPException (400)
-        If the SMILES string is empty or cannot be parsed by RDKit.
+    > Tip: Use `POST /analyze` to get both the solubility and molecule image
+    > in a single request.
     """
+    image_path = _generate_image_path(request.smiles)
+    return VisualizeResponse(image_path=image_path)
 
-    # visualize_molecule validates with RDKit, computes 2D coords, renders the
-    # structure, saves the PNG, and returns the absolute Path. ValueError is
-    # raised for any invalid input.
-    try:
-        absolute_path = visualize_molecule(request.smiles)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
 
-    # Return a path relative to the project root so the response is portable
-    # and not tied to the absolute filesystem layout of the server.
-    relative_path = absolute_path.relative_to(PROJECT_ROOT)
+@app.post(
+    "/analyze",
+    response_model=AnalyzeResponse,
+    summary="Predict solubility and generate molecule image in one call",
+    tags=["inference", "visualization"],
+)
+async def analyze(request: SMILESRequest) -> AnalyzeResponse:
+    """Run GCN prediction and 2D visualization together; return both results.
 
-    return VisualizeResponse(image_path=str(relative_path))
+    This is the recommended endpoint for frontend clients. Instead of making
+    two sequential requests (`/predict` then `/visualize`), a single call to
+    `/analyze` returns everything needed to render a result card:
+
+    - `smiles` — the input molecule
+    - `predicted_solubility` — GCN log solubility in mol/L
+    - `image_path` — relative path to the saved PNG structure image
+
+    Both operations reuse the same shared helpers used by `/predict` and
+    `/visualize`, so there is no duplicated logic.
+
+    **Example request:**
+    ```json
+    { "smiles": "CCO" }
+    ```
+
+    **Example response:**
+    ```json
+    {
+      "smiles": "CCO",
+      "predicted_solubility": -2.2591,
+      "image_path": "generated_molecules/CCO.png"
+    }
+    ```
+
+    - **Valid input** → HTTP 200 with solubility + image path
+    - **Invalid SMILES** → HTTP 400 with a descriptive error message
+    - **Empty string** → HTTP 422 (caught by Pydantic `min_length=1`)
+    """
+    _require_model()
+
+    # Both helpers share the same RDKit validation path. If the SMILES is
+    # invalid, _infer_solubility raises HTTP 400 before _generate_image_path
+    # is called, so we never waste time rendering an image for bad input.
+    solubility = _infer_solubility(request.smiles)
+    image_path = _generate_image_path(request.smiles)
+
+    return AnalyzeResponse(
+        smiles=request.smiles,
+        predicted_solubility=solubility,
+        image_path=image_path,
+    )
