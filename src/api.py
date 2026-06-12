@@ -64,7 +64,10 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 # Local module imports — placed after sys.path setup.
 from smiles_predict import smiles_to_graph, MOLECULENET_ESOL_NODE_FEATURES  # noqa: E402
 from predict import load_model  # noqa: E402
+from evaluate_gin import load_gin_model  # noqa: E402
 from molecule_visualizer import visualize_molecule  # noqa: E402
+from explain_gin import explain_prediction  # noqa: E402
+from explanation_visualizer import visualize_explanation  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +78,8 @@ from molecule_visualizer import visualize_molecule  # noqa: E402
 
 _cache: dict = {
     "device": None,  # torch.device — cpu or cuda
-    "model": None,   # torch.nn.Module — the loaded GCN
+    "gcn_model": None,   # torch.nn.Module — the loaded GCN
+    "gin_model": None,   # torch.nn.Module — the loaded GIN
 }
 
 
@@ -85,30 +89,39 @@ _cache: dict = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Load the GCN model once when the server starts, release on shutdown.
+    """Load the models once when the server starts, release on shutdown.
 
     Using the lifespan pattern (rather than @app.on_event) is the recommended
-    approach in FastAPI ≥ 0.93. The model is loaded before the server begins
+    approach in FastAPI ≥ 0.93. The models are loaded before the server begins
     serving requests so the first inference call has no extra latency.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # load_model reads models/gcn_esol.pth, infers the checkpoint format,
-    # instantiates GCNModel with matching dimensions, calls model.eval(), and
-    # moves the model to the selected device — all in one call.
-    model = load_model(device, MOLECULENET_ESOL_NODE_FEATURES)
+    # load_model reads models/gcn_esol.pth
+    gcn_model = load_model(device, MOLECULENET_ESOL_NODE_FEATURES)
+    
+    # load_gin_model reads models/gin_esol.pth
+    try:
+        gin_model = load_gin_model(device, MOLECULENET_ESOL_NODE_FEATURES)
+    except FileNotFoundError:
+        print("[startup] WARNING: GIN model not found. /explain will be unavailable.")
+        gin_model = None
 
     _cache["device"] = device
-    _cache["model"] = model
+    _cache["gcn_model"] = gcn_model
+    _cache["gin_model"] = gin_model
 
-    print(f"[startup] GCN model loaded on {device}")
-    print(f"[startup] Model path: {PROJECT_ROOT / 'models' / 'gcn_esol.pth'}")
+    print(f"[startup] Models loaded on {device}")
+    print(f"[startup] GCN path: {PROJECT_ROOT / 'models' / 'gcn_esol.pth'}")
+    if gin_model:
+        print(f"[startup] GIN path: {PROJECT_ROOT / 'models' / 'gin_esol.pth'}")
 
     yield  # Server handles requests between here and the code below.
 
     # Shutdown: clear cache for clean test isolation and process shutdown.
     _cache["device"] = None
-    _cache["model"] = None
+    _cache["gcn_model"] = None
+    _cache["gin_model"] = None
     print("[shutdown] Model cache cleared.")
 
 
@@ -119,13 +132,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title="Molecular Property Prediction API",
     description=(
-        "A REST API that exposes a Graph Convolutional Network (GCN) trained "
-        "on the ESOL dataset to predict aqueous solubility (log mol/L) from "
-        "SMILES molecular representations. Also generates 2D structure images.\n\n"
-        "**Quickstart:** Use `POST /analyze` to get both prediction and image in "
-        "one request — ideal for frontend consumption."
+        "A REST API that exposes GNN models trained on the ESOL dataset to "
+        "predict aqueous solubility (log mol/L) from SMILES. Includes GCN "
+        "and GIN architectures, with GNNExplainer support for GIN.\n\n"
+        "**Quickstart:** Use `POST /analyze` for GCN results, or `POST /explain` "
+        "to see which atoms influence the GIN prediction."
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -171,12 +184,7 @@ class VisualizeResponse(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    """Response body returned by POST /analyze.
-
-    Combines the outputs of /predict and /visualize so a frontend can
-    retrieve everything it needs — solubility value and molecule image path
-    — with a single HTTP request instead of two sequential calls.
-    """
+    """Response body returned by POST /analyze."""
 
     smiles: str = Field(
         description="The original SMILES string supplied by the caller."
@@ -191,6 +199,23 @@ class AnalyzeResponse(BaseModel):
         description=(
             "Relative path (from the project root) to the saved PNG file, "
             "e.g. 'generated_molecules/CCO.png'."
+        )
+    )
+
+
+class ExplainResponse(BaseModel):
+    """Response body returned by POST /explain."""
+
+    smiles: str = Field(
+        description="The original SMILES string supplied by the caller."
+    )
+    prediction: float = Field(
+        description="GIN-predicted aqueous solubility in log(mol/L)."
+    )
+    explanation_image: str = Field(
+        description=(
+            "Relative path to the GNNExplainer visualization, "
+            "e.g. 'generated_explanations/benzene_explanation.png'."
         )
     )
 
@@ -211,12 +236,21 @@ class RootResponse(BaseModel):
 # Private helpers — shared inference and visualization logic
 # ---------------------------------------------------------------------------
 
-def _require_model() -> None:
-    """Raise HTTP 503 if the model cache was not populated at startup."""
-    if _cache["model"] is None:
+def _require_gcn() -> None:
+    """Raise HTTP 503 if the GCN model was not loaded at startup."""
+    if _cache["gcn_model"] is None:
         raise HTTPException(
             status_code=503,
-            detail="Model is not available. The server may still be starting up.",
+            detail="GCN model is not available.",
+        )
+
+
+def _require_gin() -> None:
+    """Raise HTTP 503 if the GIN model was not loaded at startup."""
+    if _cache["gin_model"] is None:
+        raise HTTPException(
+            status_code=503,
+            detail="GIN model is not available.",
         )
 
 
@@ -251,7 +285,7 @@ def _infer_solubility(smiles: str) -> float:
         raise HTTPException(status_code=400, detail=str(exc))
 
     device: torch.device = _cache["device"]
-    model: torch.nn.Module = _cache["model"]
+    model: torch.nn.Module = _cache["gcn_model"]
 
     # DataLoader wraps the single graph in a mini-batch and adds the batch
     # assignment vector that global_mean_pool expects.
@@ -332,36 +366,24 @@ async def root() -> RootResponse:
     tags=["meta"],
 )
 async def health() -> HealthResponse:
-    """Confirm that the server process is alive and the GCN model is loaded.
+    """Confirm that the server process is alive and the models are loaded.
 
-    Returns HTTP 200 with ``{"status": "healthy"}`` when the model is ready.
+    Returns HTTP 200 with ``{"status": "healthy"}`` when the GCN is ready.
     Returns HTTP 503 if startup failed or the model has not loaded yet.
-    Suitable for use as a Kubernetes/Docker liveness or readiness probe.
     """
-    _require_model()
+    _require_gcn()
     return HealthResponse(status="healthy")
 
 
 @app.post(
     "/predict",
     response_model=PredictResponse,
-    summary="Predict aqueous solubility from SMILES",
+    summary="Predict aqueous solubility from SMILES (GCN)",
     tags=["inference"],
 )
 async def predict(request: SMILESRequest) -> PredictResponse:
-    """Run GCN inference and return the predicted log solubility.
-
-    The SMILES string is validated with RDKit before the model is touched.
-    The cached GCN model is used — no checkpoint file is read per request.
-
-    - **Valid input** → HTTP 200 with predicted solubility
-    - **Invalid SMILES** → HTTP 400 with a descriptive error message
-    - **Empty string** → HTTP 422 (caught by Pydantic `min_length=1`)
-
-    > Tip: Use `POST /analyze` to get both the solubility and molecule image
-    > in a single request.
-    """
-    _require_model()
+    """Run GCN inference and return the predicted log solubility."""
+    _require_gcn()
     solubility = _infer_solubility(request.smiles)
     return PredictResponse(smiles=request.smiles, predicted_solubility=solubility)
 
@@ -373,19 +395,7 @@ async def predict(request: SMILESRequest) -> PredictResponse:
     tags=["visualization"],
 )
 async def visualize(request: SMILESRequest) -> VisualizeResponse:
-    """Render a 2D molecular structure image and save it as a PNG.
-
-    Delegates to `molecule_visualizer.visualize_molecule` which handles
-    RDKit parsing, 2D coordinate generation, and PNG export. The image is
-    saved under `generated_molecules/` in the project root.
-
-    - **Valid input** → HTTP 200 with relative image path
-    - **Invalid SMILES** → HTTP 400 with a descriptive error message
-    - **Empty string** → HTTP 422 (caught by Pydantic `min_length=1`)
-
-    > Tip: Use `POST /analyze` to get both the solubility and molecule image
-    > in a single request.
-    """
+    """Render a 2D molecular structure image and save it as a PNG."""
     image_path = _generate_image_path(request.smiles)
     return VisualizeResponse(image_path=image_path)
 
@@ -393,46 +403,12 @@ async def visualize(request: SMILESRequest) -> VisualizeResponse:
 @app.post(
     "/analyze",
     response_model=AnalyzeResponse,
-    summary="Predict solubility and generate molecule image in one call",
+    summary="Predict solubility (GCN) and generate molecule image in one call",
     tags=["inference", "visualization"],
 )
 async def analyze(request: SMILESRequest) -> AnalyzeResponse:
-    """Run GCN prediction and 2D visualization together; return both results.
-
-    This is the recommended endpoint for frontend clients. Instead of making
-    two sequential requests (`/predict` then `/visualize`), a single call to
-    `/analyze` returns everything needed to render a result card:
-
-    - `smiles` — the input molecule
-    - `predicted_solubility` — GCN log solubility in mol/L
-    - `image_path` — relative path to the saved PNG structure image
-
-    Both operations reuse the same shared helpers used by `/predict` and
-    `/visualize`, so there is no duplicated logic.
-
-    **Example request:**
-    ```json
-    { "smiles": "CCO" }
-    ```
-
-    **Example response:**
-    ```json
-    {
-      "smiles": "CCO",
-      "predicted_solubility": -2.2591,
-      "image_path": "generated_molecules/CCO.png"
-    }
-    ```
-
-    - **Valid input** → HTTP 200 with solubility + image path
-    - **Invalid SMILES** → HTTP 400 with a descriptive error message
-    - **Empty string** → HTTP 422 (caught by Pydantic `min_length=1`)
-    """
-    _require_model()
-
-    # Both helpers share the same RDKit validation path. If the SMILES is
-    # invalid, _infer_solubility raises HTTP 400 before _generate_image_path
-    # is called, so we never waste time rendering an image for bad input.
+    """Run GCN prediction and 2D visualization together."""
+    _require_gcn()
     solubility = _infer_solubility(request.smiles)
     image_path = _generate_image_path(request.smiles)
 
@@ -440,4 +416,52 @@ async def analyze(request: SMILESRequest) -> AnalyzeResponse:
         smiles=request.smiles,
         predicted_solubility=solubility,
         image_path=image_path,
+    )
+
+
+@app.post(
+    "/explain",
+    response_model=ExplainResponse,
+    summary="Generate GNNExplainer visualization for GIN prediction",
+    tags=["explainability"],
+)
+async def explain(request: SMILESRequest) -> ExplainResponse:
+    """Explain a GIN solubility prediction using GNNExplainer.
+
+    This endpoint:
+    1. Runs the GIN model to predict solubility.
+    2. Uses GNNExplainer to find the most influential atoms and features.
+    3. Produces a 2D visualization where influential atoms are highlighted in red.
+    4. Returns the predicted value and the path to the explanation image.
+
+    **Example request:**
+    ```json
+    { "smiles": "c1ccccc1" }
+    ```
+
+    - **Valid input** → HTTP 200 with prediction + explanation image path
+    - **Invalid SMILES** → HTTP 400 with a descriptive error message
+    - **GIN missing** → HTTP 503 if `models/gin_esol.pth` is not available
+    """
+    _require_gin()
+
+    try:
+        # explain_prediction performs inference and runs GNNExplainer
+        prediction, explanation = explain_prediction(request.smiles)
+        
+        # node_mask identifies atom importance
+        node_importance = explanation.node_mask.sum(dim=1)
+        
+        # visualize_explanation renders the highlighted PNG
+        image_path = visualize_explanation(request.smiles, node_importance)
+        
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Explanation failed: {str(exc)}")
+
+    return ExplainResponse(
+        smiles=request.smiles,
+        prediction=round(prediction, 4),
+        explanation_image=str(image_path.relative_to(PROJECT_ROOT)),
     )
