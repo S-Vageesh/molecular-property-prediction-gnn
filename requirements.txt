@@ -6,3 +6,11 @@ numpy
 scikit-learn
 matplotlib
 networkx
+matplotlib
+networkx
+numpy
+pandas
+rdkit
+scikit-learn
+torch
+torch-geometric
